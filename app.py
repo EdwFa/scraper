@@ -143,10 +143,12 @@ async def run_scraper(status_container, progress_container, stats_container, act
                     person_data = {}
                     global_inn = ""
                     
+                    person_type = ""
+                    
                     if legal_entity:
                         global_inn = legal_entity.get("inn", "")
+                        person_type = "Юридические лица"
                         person_data = {
-                            "Тип": "Юридические лица",
                             "Полное наименование": legal_entity.get("fullName", ""),
                             "Краткое наименование": legal_entity.get("shortName", ""),
                             "Адрес": legal_entity.get("address", ""),
@@ -155,8 +157,8 @@ async def run_scraper(status_container, progress_container, stats_container, act
                         }
                     elif ip_entity:
                         global_inn = ip_entity.get("inn", "")
+                        person_type = "Индивидуальные предприниматели"
                         person_data = {
-                            "Тип": "Индивидуальные предприниматели",
                             "ФИО": ip_entity.get("fio", ""),
                             "ИНН": global_inn,
                             "ОГРНИП": ip_entity.get("ogrnip", "")
@@ -176,6 +178,7 @@ async def run_scraper(status_container, progress_container, stats_container, act
                         "Адрес места осуществления деятельности": control_obj.get("address", ""),
                         "Наименование контрольного органа": control_org.get("title", ""),
                         "ИНН": global_inn,
+                        "Тип": person_type,
                         "Контролируемое лицо": person_data
                     }
                     all_notices.append(notice_data)
