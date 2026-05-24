@@ -5,7 +5,8 @@ import os
 import re
 import logging
 import datetime
-from bs4 import BeautifulSoup
+import urllib.parse
+import aiohttp
 from playwright.async_api import async_playwright
 
 # Настройка логирования
@@ -16,10 +17,10 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-st.set_page_config(page_title="Выгрузка ЕРВК", page_icon="📋")
+st.set_page_config(page_title="Выгрузка ЕРВК", page_icon="📋", layout="wide")
 
-st.title("Выгрузка уведомлений с сайта ЕРВК")
-st.markdown("Программа автоматически откроет сайт, введет нужные фильтры, пролистает все страницы и соберет данные.")
+st.title("Выгрузка уведомлений с сайта ЕРВК (API Версия)")
+st.markdown("Программа перехватывает защитный токен и скачивает расширенные данные (вкл. ИНН и данные о контролируемых лицах) напрямую с серверов со скоростью до 1000 записей за секунды.")
 
 # Настройки поиска
 st.subheader("Настройки фильтров")
@@ -27,7 +28,6 @@ activity_filter = st.text_input("Вид деятельности (поиск)", 
 region_filter = st.text_input("Субъект РФ (поиск)", "Москва")
 region_exact = st.text_input("Точное название Субъекта РФ в выпадающем списке", "Г. Москва")
 
-# Асинхронная функция парсинга
 async def run_scraper(status_container, progress_container, stats_container, activity, region, exact_region):
     logging.info(f"=== ЗАПУСК ПАРСЕРА ===")
     logging.info(f"Фильтры - Вид деятельности: '{activity}', Субъект РФ: '{exact_region}'")
@@ -36,149 +36,161 @@ async def run_scraper(status_container, progress_container, stats_container, act
     if os.path.exists(output_file):
         os.remove(output_file)
         
-    all_notices = []
-    seen_ids = set()
+    auth_token = None
+    search_url_template = None
+    initial_data = None
     
-    total_matches_str = "0"
-    pages_to_process = 0
-    records_per_page = 0
-
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
 
-            async def handle_route(route):
-                # Подменяем размер страницы в скрытом API-запросе с 10 на 1000
-                if "portal/public/widgets/notices" in route.request.url and "size=" in route.request.url:
-                    new_url = re.sub(r"size=\d+", "size=1000", route.request.url)
-                    await route.continue_(url=new_url)
-                # Блокируем загрузку картинок, шрифтов и стилей для ускорения
-                elif route.request.resource_type in ["image", "media", "font", "stylesheet"]:
-                    await route.abort()
-                else:
-                    await route.continue_()
+            def handle_request(req):
+                nonlocal auth_token
+                if "portal/public/widgets/notices" in req.url:
+                    if "token" in req.headers:
+                        auth_token = req.headers["token"]
 
-            await page.route("**/*", handle_route)
+            page.on("request", handle_request)
+            await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font", "stylesheet"] else route.continue_())
 
-            status_container.info("⏳ Открываем сайт ervk.gov.ru...")
+            status_container.info("⏳ Открываем сайт ervk.gov.ru и получаем ключи доступа...")
             await page.goto("https://ervk.gov.ru/public/notices", wait_until="networkidle")
             
-            status_container.info("⏳ Открываем расширенный поиск...")
             await page.click("text=Расширенный поиск")
             await page.wait_for_timeout(1000)
 
-            status_container.info("⏳ Заполняем фильтр 'Вид деятельности'...")
+            status_container.info("⏳ Заполняем фильтры...")
             await page.locator("label").filter(has_text="Вид деятельности").locator("..").locator("input").fill(activity)
             await page.wait_for_timeout(1500)
             await page.locator("li[role='option']").first.click()
             await page.wait_for_timeout(1000)
 
-            status_container.info("⏳ Заполняем фильтр 'Субъект РФ'...")
             await page.locator("label").filter(has_text="Субъект РФ").locator("..").locator("input").fill(region)
             await page.wait_for_timeout(1500)
             
-            status_container.info("⏳ Ждем применения фильтров и загрузки данных от сервера...")
-            # Ждем именно тот сетевой запрос, который уходит после клика на Субъект РФ
-            async with page.expect_response(lambda r: "portal/public/widgets/notices" in r.url, timeout=60000):
+            async with page.expect_response(lambda r: "portal/public/widgets/notices" in r.url and "regionCodeList" in r.url, timeout=60000) as response_info:
                 await page.locator("li[role='option']").filter(has_text=exact_region).click()
             
-            # Даем браузеру время (5 сек) отрисовать 1000 элементов в DOM после получения ответа
-            await page.wait_for_timeout(5000)
-
-            html = await page.content()
-            soup = BeautifulSoup(html, 'html.parser')
+            final_response = await response_info.value
+            initial_data = await final_response.json()
+            search_url_template = final_response.url
             
-            el = soup.find(string=lambda t: t and 'Найдено совпадений' in t)
-            if el and el.parent and el.parent.parent:
-                match_text = el.parent.parent.text
-                matches = re.findall(r'\d+', match_text)
-                if matches:
-                    total_matches_str = matches[0]
-
-            first_page_cards = soup.find_all('div', class_='fp-fp-MuiBox-root css-0')
-            first_page_records = [c for c in first_page_cards if 'Работы или услуги:' in c.get_text()]
-            records_per_page = len(first_page_records)
-            
-            if total_matches_str.isdigit() and records_per_page > 0:
-                import math
-                pages_to_process = math.ceil(int(total_matches_str) / records_per_page)
-                
-            logging.info(f"Анализ завершен. Найдено совпадений: {total_matches_str}, страниц для обхода: {pages_to_process}")
-
-            stats_container.info(f"📊 **Анализ фильтров завершен!**\n\n"
-                                 f"Найдено совпадений: **{total_matches_str}**\n\n"
-                                 f"Записей на одной странице: **{records_per_page}**\n\n"
-                                 f"Примерное количество страниц для обхода: **{pages_to_process}**")
-
-            page_num = 1
-            while True:
-                progress_container.warning(f"🔄 Идет сбор данных со страницы {page_num} из {pages_to_process}...")
-                html = await page.content()
-                soup = BeautifulSoup(html, 'html.parser')
-                
-                cards = soup.find_all('div', class_='fp-fp-MuiBox-root css-0')
-                page_extracted = 0
-                
-                for card in cards:
-                    text = card.get_text(separator='|')
-                    if 'Работы или услуги:' in text:
-                        parts = text.split('|')
-                        try:
-                            notice_id = parts[0].strip()
-                            if notice_id in seen_ids:
-                                continue
-                            seen_ids.add(notice_id)
-                            
-                            def get_value_after(title):
-                                try:
-                                    idx = parts.index(title)
-                                    return parts[idx+1].strip() if idx + 1 < len(parts) else ""
-                                except ValueError:
-                                    return ""
-
-                            notice_data = {
-                                "номер уведомления": notice_id,
-                                "наименование хозяйствующего субъекта": parts[1].strip() if len(parts) > 1 else "",
-                                "дата": parts[2].replace("От ", "").strip() if len(parts) > 2 else "",
-                                "наименование уведомления": parts[3].strip() if len(parts) > 3 else "",
-                                "наименование работы или услуги": get_value_after("Работы или услуги:"),
-                                "коды ОКВЭД": get_value_after("Коды ОКВЭД:"),
-                                "Субъект РФ": get_value_after("Субъект РФ:"),
-                                "Адрес места осуществления деятельности": get_value_after("Адрес места осуществления деятельности:"),
-                                "Наименование контрольного органа": get_value_after("Наименование контрольного органа:")
-                            }
-                            all_notices.append(notice_data)
-                            page_extracted += 1
-                        except Exception as e:
-                            logging.error(f"Ошибка при парсинге карточки на странице {page_num}: {e}. Текст карточки: {text}")
-
-                logging.info(f"Страница {page_num} обработана. Извлечено записей: {page_extracted}")
-
-                next_btn = page.locator("button[aria-label='Перейти на следующую страницу']")
-                count = await next_btn.count()
-                if count == 0:
-                    break
-                    
-                is_disabled = await next_btn.is_disabled()
-                if is_disabled:
-                    break
-                    
-                await next_btn.click()
-                page_num += 1
-                # Увеличиваем паузу, т.к. браузеру нужно отрендерить 1000 элементов вместо 10
-                await page.wait_for_timeout(4000)
-
-            progress_container.empty()
-            status_container.success(f"✅ Сбор завершен. Всего найдено уведомлений: {len(all_notices)}")
-            
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(all_notices, f, ensure_ascii=False, indent=4)
-                
-            logging.info(f"Сбор успешно завершен. Ожидалось записей: {total_matches_str}, фактически собрано и записано в JSON: {len(all_notices)}")
-
             await browser.close()
-            return output_file, all_notices
+            
+        if not auth_token:
+            raise Exception("Не удалось перехватить токен авторизации!")
+            
+        total_elements = initial_data.get("totalElements", 0)
+        pages_to_process = (total_elements + 999) // 1000
+
+        logging.info(f"Анализ API завершен. Найдено совпадений: {total_elements}, страниц API (по 1000 шт): {pages_to_process}")
+
+        stats_container.info(f"📊 **Анализ фильтров завершен!**\n\n"
+                             f"Найдено совпадений: **{total_elements}**\n\n"
+                             f"Авторизация пройдена успешно (Токен перехвачен). Начинаем скоростное скачивание...")
+
+        all_notices = []
+        seen_ids = set()
+        
+        sem = asyncio.Semaphore(10)  # Не больше 10 одновременных запросов к деталям
+
+        async def fetch_details(session, notice_id):
+            url = f"https://ervk.gov.ru/portal/public/notices/{notice_id}"
+            headers = {"token": auth_token, "accept": "application/json"}
+            async with sem:
+                try:
+                    async with session.get(url, headers=headers) as resp:
+                        if resp.status == 200:
+                            return await resp.json()
+                except Exception as e:
+                    logging.error(f"Ошибка получения деталей {notice_id}: {e}")
+            return None
+
+        async with aiohttp.ClientSession() as session:
+            for page_idx in range(pages_to_process):
+                progress_container.warning(f"🔄 Скачиваем страницу {page_idx + 1} из {pages_to_process} (записи с {page_idx * 1000} по {(page_idx + 1) * 1000})...")
+                
+                # Формируем URL для списка из 1000 ID
+                page_url = re.sub(r'size=\d+', 'size=1000', search_url_template)
+                page_url = re.sub(r'page=\d+', f'page={page_idx}', page_url)
+                
+                async with session.get(page_url, headers={"token": auth_token}) as resp:
+                    if resp.status != 200:
+                        logging.error(f"Ошибка загрузки страницы {page_idx}: {resp.status}")
+                        continue
+                    page_data = await resp.json()
+                    
+                notices_list = page_data.get("notices", [])
+                notice_ids = [n["id"] for n in notices_list if n["id"] not in seen_ids]
+                
+                # Параллельное скачивание деталей для всей 1000 записей
+                progress_container.info(f"⚡ Скачиваем детали (ИНН, ОГРН и др.) для {len(notice_ids)} записей (может занять 20-30 секунд)...")
+                tasks = [fetch_details(session, nid) for nid in notice_ids]
+                details_results = await asyncio.gather(*tasks)
+                
+                for detail in details_results:
+                    if not detail:
+                        continue
+                        
+                    notice_id_str = str(detail.get("id"))
+                    seen_ids.add(notice_id_str)
+                    
+                    # Извлечение ИНН и субъекта из подструктур
+                    legal_entity = detail.get("legalEntity")
+                    ip_entity = detail.get("individualEntrepreneur")
+                    
+                    person_data = {}
+                    global_inn = ""
+                    
+                    if legal_entity:
+                        global_inn = legal_entity.get("inn", "")
+                        person_data = {
+                            "Тип": "Юридические лица",
+                            "Полное наименование": legal_entity.get("fullName", ""),
+                            "Краткое наименование": legal_entity.get("shortName", ""),
+                            "Адрес": legal_entity.get("address", ""),
+                            "ИНН": global_inn,
+                            "ОГРН": legal_entity.get("ogrn", "")
+                        }
+                    elif ip_entity:
+                        global_inn = ip_entity.get("inn", "")
+                        person_data = {
+                            "Тип": "Индивидуальные предприниматели",
+                            "ФИО": ip_entity.get("fio", ""),
+                            "ИНН": global_inn,
+                            "ОГРНИП": ip_entity.get("ogrnip", "")
+                        }
+                        
+                    control_obj = detail.get("controlObject", {})
+                    control_org = detail.get("controlOrgan", {})
+                    activity_obj = detail.get("activity", {})
+
+                    notice_data = {
+                        "номер уведомления": detail.get("number", ""),
+                        "наименование хозяйствующего субъекта": control_obj.get("name", ""),
+                        "дата": detail.get("noticeDate", ""),
+                        "наименование работы или услуги": activity_obj.get("workAndServiceTitle", ""),
+                        "коды ОКВЭД": detail.get("okvedList", ""),
+                        "Субъект РФ": control_obj.get("regionTitle", ""),
+                        "Адрес места осуществления деятельности": control_obj.get("address", ""),
+                        "Наименование контрольного органа": control_org.get("title", ""),
+                        "ИНН": global_inn,
+                        "Контролируемое лицо": person_data
+                    }
+                    all_notices.append(notice_data)
+                    
+                logging.info(f"Страница {page_idx + 1} обработана. Всего собрано на данный момент: {len(all_notices)}")
+
+        progress_container.empty()
+        status_container.success(f"✅ Сбор завершен. Всего найдено и сохранено уведомлений: {len(all_notices)}")
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(all_notices, f, ensure_ascii=False, indent=4)
+            
+        logging.info(f"Сбор успешно завершен. Ожидалось записей: {total_elements}, фактически собрано и записано в JSON: {len(all_notices)}")
+
+        return output_file, all_notices
             
     except Exception as ex:
         logging.error(f"Критическая ошибка в процессе работы парсера: {ex}", exc_info=True)
@@ -190,7 +202,7 @@ if st.button("Начать выгрузку", type="primary"):
     status_container = st.empty()
     progress_container = st.empty()
     
-    with st.spinner('Браузер работает в фоновом режиме. Пожалуйста, подождите...'):
+    with st.spinner('Скрипт перехватывает доступ к API...'):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
@@ -200,7 +212,7 @@ if st.button("Начать выгрузку", type="primary"):
             )
         except Exception as e:
             st.error(f"Произошла ошибка при сборе: см. файл логов scraper.log")
-            logging.info(f"=== ЗАВЕРШЕНО С ОШИБКОЙ ===")
+            logging.info(f"=== ЗАВЕРШЕНО С ОШИБКОЙ ===\n{e}")
             data = []
         finally:
             loop.close()
