@@ -20,7 +20,7 @@ logging.basicConfig(
 st.set_page_config(page_title="Выгрузка ЕРВК", page_icon="📋", layout="wide")
 
 st.title("Выгрузка уведомлений с сайта ЕРВК (API Версия)")
-st.markdown("Программа перехватывает защитный токен и скачивает расширенные данные (вкл. ИНН и данные о контролируемых лицах) напрямую с серверов со скоростью до 1000 записей за секунды.")
+st.markdown("Программа перехватывает защитный токен и скачивает расширенные данные (вкл. ИНН и данные о контролируемых лицах) напрямую с серверов со скоростью до 1000 записей за секунды. Автоматически обновляет токены при истечении.")
 
 # Настройки поиска
 st.subheader("Настройки фильтров")
@@ -36,7 +36,7 @@ async def run_scraper(status_container, progress_container, stats_container, act
     if os.path.exists(output_file):
         os.remove(output_file)
         
-    auth_token = None
+    auth_state = {"token": None}
     search_url_template = None
     initial_data = None
     
@@ -46,10 +46,9 @@ async def run_scraper(status_container, progress_container, stats_container, act
             page = await browser.new_page()
 
             def handle_request(req):
-                nonlocal auth_token
                 if "portal/public/widgets/notices" in req.url:
                     if "token" in req.headers:
-                        auth_token = req.headers["token"]
+                        auth_state["token"] = req.headers["token"]
 
             page.on("request", handle_request)
             await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font", "stylesheet"] else route.continue_())
@@ -76,125 +75,164 @@ async def run_scraper(status_container, progress_container, stats_container, act
             initial_data = await final_response.json()
             search_url_template = final_response.url
             
+            if not auth_state["token"]:
+                raise Exception("Не удалось перехватить токен авторизации!")
+                
+            total_elements = initial_data.get("totalElements", 0)
+            pages_to_process = (total_elements + 999) // 1000
+
+            logging.info(f"Анализ API завершен. Найдено совпадений: {total_elements}, страниц API (по 1000 шт): {pages_to_process}")
+
+            stats_container.info(f"📊 **Анализ фильтров завершен!**\n\n"
+                                 f"Найдено совпадений: **{total_elements}**\n\n"
+                                 f"Авторизация пройдена успешно. Начинаем скоростное скачивание...")
+
+            all_notices = []
+            seen_ids = set()
+            
+            # Функция обновления токена через браузер
+            async def refresh_token():
+                logging.info("♻️ Запрашиваем новый токен через браузер...")
+                old_token = auth_state["token"]
+                await page.reload(wait_until="networkidle")
+                for _ in range(15):
+                    if auth_state["token"] != old_token:
+                        logging.info("✅ Новый токен успешно получен!")
+                        return True
+                    await asyncio.sleep(1)
+                return False
+
+            sem = asyncio.Semaphore(10)
+
+            async def fetch_details(session, notice_id, retries=2):
+                url = f"https://ervk.gov.ru/portal/public/notices/{notice_id}"
+                for attempt in range(retries):
+                    headers = {"token": auth_state["token"], "accept": "application/json"}
+                    async with sem:
+                        try:
+                            async with session.get(url, headers=headers) as resp:
+                                if resp.status == 200:
+                                    return await resp.json()
+                                elif resp.status == 401:
+                                    return "401" # Сигнал о протухании
+                        except Exception as e:
+                            logging.error(f"Ошибка получения деталей {notice_id}: {e}")
+                            await asyncio.sleep(2)
+                return None
+
+            connector = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                for page_idx in range(pages_to_process):
+                    progress_container.warning(f"🔄 Скачиваем страницу {page_idx + 1} из {pages_to_process} (записи с {page_idx * 1000} по {(page_idx + 1) * 1000})...")
+                    
+                    page_url = re.sub(r'size=\d+', 'size=1000', search_url_template)
+                    page_url = re.sub(r'page=\d+', f'page={page_idx}', page_url)
+                    
+                    # Пытаемся получить список, с логикой обновления токена
+                    notices_list = None
+                    for list_attempt in range(3):
+                        async with session.get(page_url, headers={"token": auth_state["token"]}) as resp:
+                            if resp.status == 401:
+                                logging.warning(f"Ошибка 401 при получении списка (страница {page_idx}). Обновляем токен...")
+                                await refresh_token()
+                                continue
+                            elif resp.status == 200:
+                                page_data = await resp.json()
+                                notices_list = page_data.get("notices", [])
+                                break
+                            else:
+                                logging.error(f"Ошибка загрузки страницы {page_idx}: {resp.status}")
+                                break
+                    
+                    if notices_list is None:
+                        logging.error(f"Не удалось загрузить страницу {page_idx} после попыток.")
+                        continue
+                        
+                    notice_ids = [n["id"] for n in notices_list if n["id"] not in seen_ids]
+                    
+                    progress_container.info(f"⚡ Скачиваем детали (ИНН, ОГРН и др.) для {len(notice_ids)} записей (может занять 20-30 секунд)...")
+                    
+                    # Разбиваем скачивание на батчи, чтобы вовремя ловить 401 и не заваливать сервер 1000 провальными запросами
+                    batch_size = 50
+                    for i in range(0, len(notice_ids), batch_size):
+                        batch_ids = notice_ids[i:i+batch_size]
+                        
+                        tasks = [fetch_details(session, nid) for nid in batch_ids]
+                        details_results = await asyncio.gather(*tasks)
+                        
+                        # Если хотя бы один запрос вернул 401, обновляем токен и перекачиваем батч
+                        if "401" in details_results:
+                            logging.warning("Обнаружен 401 при загрузке деталей. Обновляем токен и повторяем батч...")
+                            await refresh_token()
+                            tasks = [fetch_details(session, nid) for nid in batch_ids]
+                            details_results = await asyncio.gather(*tasks)
+                            
+                        for detail in details_results:
+                            if not detail or detail == "401":
+                                continue
+                                
+                            notice_id_str = str(detail.get("id"))
+                            seen_ids.add(notice_id_str)
+                            
+                            legal_entity = detail.get("legalEntity")
+                            ip_entity = detail.get("individualEntrepreneur")
+                            
+                            person_data = {}
+                            global_inn = ""
+                            person_type = ""
+                            
+                            if legal_entity:
+                                global_inn = legal_entity.get("inn", "")
+                                person_type = "Юридические лица"
+                                person_data = {
+                                    "Полное наименование": legal_entity.get("fullName", ""),
+                                    "Краткое наименование": legal_entity.get("shortName", ""),
+                                    "Адрес": legal_entity.get("address", ""),
+                                    "ИНН": global_inn,
+                                    "ОГРН": legal_entity.get("ogrn", "")
+                                }
+                            elif ip_entity:
+                                global_inn = ip_entity.get("inn", "")
+                                person_type = "Индивидуальные предприниматели"
+                                person_data = {
+                                    "ФИО": ip_entity.get("fio", ""),
+                                    "ИНН": global_inn,
+                                    "ОГРНИП": ip_entity.get("ogrnip", "")
+                                }
+                                
+                            control_obj = detail.get("controlObject", {})
+                            control_org = detail.get("controlOrgan", {})
+                            activity_obj = detail.get("activity", {})
+
+                            notice_data = {
+                                "номер уведомления": detail.get("number", ""),
+                                "наименование хозяйствующего субъекта": control_obj.get("name", ""),
+                                "дата": detail.get("noticeDate", ""),
+                                "наименование работы или услуги": activity_obj.get("workAndServiceTitle", ""),
+                                "коды ОКВЭД": detail.get("okvedList", ""),
+                                "Субъект РФ": control_obj.get("regionTitle", ""),
+                                "Адрес места осуществления деятельности": control_obj.get("address", ""),
+                                "Наименование контрольного органа": control_org.get("title", ""),
+                                "ИНН": global_inn,
+                                "Тип": person_type,
+                                "Контролируемое лицо": person_data
+                            }
+                            all_notices.append(notice_data)
+                            
+                    logging.info(f"Страница {page_idx + 1} обработана. Всего собрано на данный момент: {len(all_notices)}")
+
+            # Только когда весь цикл завершен, закрываем браузер
             await browser.close()
+
+            progress_container.empty()
+            status_container.success(f"✅ Сбор завершен. Всего найдено и сохранено уведомлений: {len(all_notices)}")
             
-        if not auth_token:
-            raise Exception("Не удалось перехватить токен авторизации!")
-            
-        total_elements = initial_data.get("totalElements", 0)
-        pages_to_process = (total_elements + 999) // 1000
-
-        logging.info(f"Анализ API завершен. Найдено совпадений: {total_elements}, страниц API (по 1000 шт): {pages_to_process}")
-
-        stats_container.info(f"📊 **Анализ фильтров завершен!**\n\n"
-                             f"Найдено совпадений: **{total_elements}**\n\n"
-                             f"Авторизация пройдена успешно (Токен перехвачен). Начинаем скоростное скачивание...")
-
-        all_notices = []
-        seen_ids = set()
-        
-        sem = asyncio.Semaphore(10)  # Не больше 10 одновременных запросов к деталям
-
-        async def fetch_details(session, notice_id):
-            url = f"https://ervk.gov.ru/portal/public/notices/{notice_id}"
-            headers = {"token": auth_token, "accept": "application/json"}
-            async with sem:
-                try:
-                    async with session.get(url, headers=headers) as resp:
-                        if resp.status == 200:
-                            return await resp.json()
-                except Exception as e:
-                    logging.error(f"Ошибка получения деталей {notice_id}: {e}")
-            return None
-
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            for page_idx in range(pages_to_process):
-                progress_container.warning(f"🔄 Скачиваем страницу {page_idx + 1} из {pages_to_process} (записи с {page_idx * 1000} по {(page_idx + 1) * 1000})...")
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(all_notices, f, ensure_ascii=False, indent=4)
                 
-                # Формируем URL для списка из 1000 ID
-                page_url = re.sub(r'size=\d+', 'size=1000', search_url_template)
-                page_url = re.sub(r'page=\d+', f'page={page_idx}', page_url)
-                
-                async with session.get(page_url, headers={"token": auth_token}) as resp:
-                    if resp.status != 200:
-                        logging.error(f"Ошибка загрузки страницы {page_idx}: {resp.status}")
-                        continue
-                    page_data = await resp.json()
-                    
-                notices_list = page_data.get("notices", [])
-                notice_ids = [n["id"] for n in notices_list if n["id"] not in seen_ids]
-                
-                # Параллельное скачивание деталей для всей 1000 записей
-                progress_container.info(f"⚡ Скачиваем детали (ИНН, ОГРН и др.) для {len(notice_ids)} записей (может занять 20-30 секунд)...")
-                tasks = [fetch_details(session, nid) for nid in notice_ids]
-                details_results = await asyncio.gather(*tasks)
-                
-                for detail in details_results:
-                    if not detail:
-                        continue
-                        
-                    notice_id_str = str(detail.get("id"))
-                    seen_ids.add(notice_id_str)
-                    
-                    # Извлечение ИНН и субъекта из подструктур
-                    legal_entity = detail.get("legalEntity")
-                    ip_entity = detail.get("individualEntrepreneur")
-                    
-                    person_data = {}
-                    global_inn = ""
-                    
-                    person_type = ""
-                    
-                    if legal_entity:
-                        global_inn = legal_entity.get("inn", "")
-                        person_type = "Юридические лица"
-                        person_data = {
-                            "Полное наименование": legal_entity.get("fullName", ""),
-                            "Краткое наименование": legal_entity.get("shortName", ""),
-                            "Адрес": legal_entity.get("address", ""),
-                            "ИНН": global_inn,
-                            "ОГРН": legal_entity.get("ogrn", "")
-                        }
-                    elif ip_entity:
-                        global_inn = ip_entity.get("inn", "")
-                        person_type = "Индивидуальные предприниматели"
-                        person_data = {
-                            "ФИО": ip_entity.get("fio", ""),
-                            "ИНН": global_inn,
-                            "ОГРНИП": ip_entity.get("ogrnip", "")
-                        }
-                        
-                    control_obj = detail.get("controlObject", {})
-                    control_org = detail.get("controlOrgan", {})
-                    activity_obj = detail.get("activity", {})
+            logging.info(f"Сбор успешно завершен. Ожидалось записей: {total_elements}, фактически собрано и записано в JSON: {len(all_notices)}")
 
-                    notice_data = {
-                        "номер уведомления": detail.get("number", ""),
-                        "наименование хозяйствующего субъекта": control_obj.get("name", ""),
-                        "дата": detail.get("noticeDate", ""),
-                        "наименование работы или услуги": activity_obj.get("workAndServiceTitle", ""),
-                        "коды ОКВЭД": detail.get("okvedList", ""),
-                        "Субъект РФ": control_obj.get("regionTitle", ""),
-                        "Адрес места осуществления деятельности": control_obj.get("address", ""),
-                        "Наименование контрольного органа": control_org.get("title", ""),
-                        "ИНН": global_inn,
-                        "Тип": person_type,
-                        "Контролируемое лицо": person_data
-                    }
-                    all_notices.append(notice_data)
-                    
-                logging.info(f"Страница {page_idx + 1} обработана. Всего собрано на данный момент: {len(all_notices)}")
-
-        progress_container.empty()
-        status_container.success(f"✅ Сбор завершен. Всего найдено и сохранено уведомлений: {len(all_notices)}")
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(all_notices, f, ensure_ascii=False, indent=4)
-            
-        logging.info(f"Сбор успешно завершен. Ожидалось записей: {total_elements}, фактически собрано и записано в JSON: {len(all_notices)}")
-
-        return output_file, all_notices
+            return output_file, all_notices
             
     except Exception as ex:
         logging.error(f"Критическая ошибка в процессе работы парсера: {ex}", exc_info=True)
@@ -206,7 +244,7 @@ if st.button("Начать выгрузку", type="primary"):
     status_container = st.empty()
     progress_container = st.empty()
     
-    with st.spinner('Скрипт перехватывает доступ к API...'):
+    with st.spinner('Скрипт работает...'):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
