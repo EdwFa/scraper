@@ -107,7 +107,8 @@ async def run_scraper(status_container, progress_container, stats_container, act
                     logging.error(f"Ошибка получения деталей {notice_id}: {e}")
             return None
 
-        async with aiohttp.ClientSession() as session:
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
             for page_idx in range(pages_to_process):
                 progress_container.warning(f"🔄 Скачиваем страницу {page_idx + 1} из {pages_to_process} (записи с {page_idx * 1000} по {(page_idx + 1) * 1000})...")
                 
