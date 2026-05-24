@@ -48,6 +48,19 @@ async def run_scraper(status_container, progress_container, stats_container, act
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
 
+            async def handle_route(route):
+                # Подменяем размер страницы в скрытом API-запросе с 10 на 1000
+                if "portal/public/widgets/notices" in route.request.url and "size=" in route.request.url:
+                    new_url = re.sub(r"size=\d+", "size=1000", route.request.url)
+                    await route.continue_(url=new_url)
+                # Блокируем загрузку картинок, шрифтов и стилей для ускорения
+                elif route.request.resource_type in ["image", "media", "font", "stylesheet"]:
+                    await route.abort()
+                else:
+                    await route.continue_()
+
+            await page.route("**/*", handle_route)
+
             status_container.info("⏳ Открываем сайт ervk.gov.ru...")
             await page.goto("https://ervk.gov.ru/public/notices", wait_until="networkidle")
             
@@ -64,10 +77,14 @@ async def run_scraper(status_container, progress_container, stats_container, act
             status_container.info("⏳ Заполняем фильтр 'Субъект РФ'...")
             await page.locator("label").filter(has_text="Субъект РФ").locator("..").locator("input").fill(region)
             await page.wait_for_timeout(1500)
-            await page.locator("li[role='option']").filter(has_text=exact_region).click()
             
-            status_container.info("⏳ Ждем применения фильтров и загрузки данных...")
-            await page.wait_for_timeout(3000)
+            status_container.info("⏳ Ждем применения фильтров и загрузки данных от сервера...")
+            # Ждем именно тот сетевой запрос, который уходит после клика на Субъект РФ
+            async with page.expect_response(lambda r: "portal/public/widgets/notices" in r.url, timeout=60000):
+                await page.locator("li[role='option']").filter(has_text=exact_region).click()
+            
+            # Даем браузеру время (5 сек) отрисовать 1000 элементов в DOM после получения ответа
+            await page.wait_for_timeout(5000)
 
             html = await page.content()
             soup = BeautifulSoup(html, 'html.parser')
@@ -149,7 +166,8 @@ async def run_scraper(status_container, progress_container, stats_container, act
                     
                 await next_btn.click()
                 page_num += 1
-                await page.wait_for_timeout(2500)
+                # Увеличиваем паузу, т.к. браузеру нужно отрендерить 1000 элементов вместо 10
+                await page.wait_for_timeout(4000)
 
             progress_container.empty()
             status_container.success(f"✅ Сбор завершен. Всего найдено уведомлений: {len(all_notices)}")
